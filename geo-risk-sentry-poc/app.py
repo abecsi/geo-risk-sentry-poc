@@ -394,7 +394,37 @@ if ticker:
         # This uses Streamlit's internal token, so it works 100% of the time.
         st.map(map_df, zoom=10, size='size')
         
-         # --- 7. NEWS SCRAPER (DDG) ---
+        # --- 7. FINANCIAL IMPACT MODEL ---
+        st.divider()
+        st.subheader("💰 Parametric Revenue-at-Risk Model")
+        daily_rev, est_loss, disrupt_pct = calculate_revenue_at_risk(info, rain)
+        
+        if daily_rev:
+            f_col1, f_col2, f_col3 = st.columns(3)
+            with f_col1: st.metric("Daily Revenue (TTM)", f"{format_large_number(daily_rev)} {currency}")
+            with f_col2: st.metric("Operational Drag", f"{disrupt_pct*100:.1f}%", f"{rain} mm Rain", delta_color="inverse")
+            with f_col3: st.metric("Est. Daily Loss (VaR)", f"{format_large_number(est_loss)} {currency}", "Risk Exposure", delta_color="inverse")
+            
+            if est_loss > 0:
+                st.warning(f"⚠️ Financial Alert: Current weather conditions in {location_name} are estimated to impact daily turnover by **{format_large_number(est_loss)}**. This assumes a **{info.get('sector')}** sector vulnerability profile.")
+            else:
+                st.success(f"✅ Low Risk: Current weather conditions are within safe operational limits for {info.get('longName')}.")
+
+        # --- 8. AI RISK ASSESSMENT REPORT ---
+        st.divider()
+        st.subheader("🤖 Live Risk Assessment")
+        
+        # Logic to determine risk status
+        risk_level = "LOW"
+        risk_color = "green"
+        if rain > 10: 
+            risk_level = "MODERATE"
+            risk_color = "orange"
+        if rain > 30 or wind > 80: 
+            risk_level = "HIGH"
+            risk_color = "red"
+
+         # --- 9. NEWS SCRAPER (DDG) ---
         st.divider()
         st.subheader("📰 OSINT: Live Climate News Scraper")
 
@@ -412,36 +442,6 @@ if ticker:
                     st.markdown(f"[Read Full Article]({news['url']})")
         else:
             st.info(f"No specific climate risk headlines found for {long_name} in the past year.")
-
-        # --- 8. FINANCIAL IMPACT MODEL ---
-        st.divider()
-        st.subheader("💰 Parametric Revenue-at-Risk Model")
-        daily_rev, est_loss, disrupt_pct = calculate_revenue_at_risk(info, rain)
-        
-        if daily_rev:
-            f_col1, f_col2, f_col3 = st.columns(3)
-            with f_col1: st.metric("Daily Revenue (TTM)", f"{format_large_number(daily_rev)} {currency}")
-            with f_col2: st.metric("Operational Drag", f"{disrupt_pct*100:.1f}%", f"{rain} mm Rain", delta_color="inverse")
-            with f_col3: st.metric("Est. Daily Loss (VaR)", f"{format_large_number(est_loss)} {currency}", "Risk Exposure", delta_color="inverse")
-            
-            if est_loss > 0:
-                st.warning(f"⚠️ Financial Alert: Current weather conditions in {location_name} are estimated to impact daily turnover by **{format_large_number(est_loss)}**. This assumes a **{info.get('sector')}** sector vulnerability profile.")
-            else:
-                st.success(f"✅ Low Risk: Current weather conditions are within safe operational limits for {info.get('longName')}.")
-
-        # --- 9. AI RISK ASSESSMENT REPORT ---
-        st.divider()
-        st.subheader("🤖 Live Risk Assessment")
-        
-        # Logic to determine risk status
-        risk_level = "LOW"
-        risk_color = "green"
-        if rain > 10: 
-            risk_level = "MODERATE"
-            risk_color = "orange"
-        if rain > 30 or wind > 80: 
-            risk_level = "HIGH"
-            risk_color = "red"
 
         # Final Report
         st.markdown(f"""
