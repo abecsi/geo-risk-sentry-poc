@@ -80,7 +80,6 @@ DEMO_DATA = {
         "country": "Netherlands",
         "totalRevenue": 27_000_000_000
     },
-    # --- SWISS TICKERS ---
     "NESN.SW": {
         "longName": "Nestlé S.A.",
         "sector": "Consumer Defensive",
@@ -219,13 +218,12 @@ def get_climate_news(ticker, company_name):
         search_term = company_name.replace("Inc.", "").replace("Corp.", "").replace("PLC", "").replace("Ltd.", "").strip()
 
     # 2. STRICT NEWS QUERY
-    # We remove the complex (OR) logic and keep it simple for the News engine
     query = f'"{search_term}" climate risk supply chain environment'
     
     try:
         with DDGS() as ddgs:
             # 3. USE .news() INSTEAD OF .text()
-            # region="us-en": Forces English results even if you are in Norway
+            # region="us-en": Forces English results
             # safesearch="moderate": Blocks adult content
             # max_results=3: Keeps it fast
             ddgs_news = ddgs.news(query, region="us-en", safesearch="moderate", max_results=3)
@@ -289,7 +287,7 @@ st.markdown("### Physical Risk & ESG Intelligence Dashboard")
 with st.sidebar:
     st.header("Asset Selection")
     # Add the tickers from our DB to the hint so users know what works best
-    ticker = st.text_input("Enter Stock Ticker:", "EQNR")
+    ticker = st.text_input("Enter Stock Ticker:", "TSLA")
     st.caption("✨ Best Data coverage: TSLA, NHY.OL, ASML, SHELL, EQNR, NOVN.SW, NESN.SW")
     
     st.divider()
@@ -377,7 +375,7 @@ if ticker:
 
         # --- 6. DYNAMIC MAP (DEFAULT STREAMLIT MAP) ---
         st.divider()
-        st.subheader(f"📍 Real-Time Asset Monitor: {location_name}")
+        st.subheader(f"Real-Time Asset Monitor: {location_name}")
         
         if is_exact_match:
             st.success(f"✅ Verified Asset Coordinates Found: **{location_name}**")
@@ -391,7 +389,7 @@ if ticker:
         })
         
         # Render the map
-        # This uses Streamlit's internal token, so it works 100% of the time.
+        # This uses Streamlit's internal token.
         st.map(map_df, zoom=10, size='size')
         
         # --- 7. FINANCIAL IMPACT MODEL ---
@@ -424,6 +422,21 @@ if ticker:
             risk_level = "HIGH"
             risk_color = "red"
 
+        # Final Report
+        st.markdown(f"""
+        **Live Physical Risk Report for: {location_name}**
+        
+        *   **Current Status:** :{risk_color}[**{risk_level} RISK**] detected.
+        *   **Precipitation (24h):** {rain} mm
+        *   **Wind Speed (Max):** {wind} km/h
+        
+        **AI Strategic Insight:**
+        Given the current weather data in **{country}**, {info.get('longName')} operations at the **{asset_label}** face **{risk_level.lower()}** disruption risk today. 
+        {"Heavy rainfall may impact local logistics and employee commute." if rain > 10 else "Weather conditions are optimal for operations."}
+        
+        *Data Source: OpenMeteo & OpenStreetMap live feed.*
+        """)
+
          # --- 9. NEWS SCRAPER (DDG) ---
         st.divider()
         st.subheader("📰 OSINT: Live Climate News Scraper")
@@ -442,21 +455,6 @@ if ticker:
                     st.markdown(f"[Read Full Article]({news['url']})")
         else:
             st.info(f"No specific climate risk headlines found for {long_name} in the past year.")
-
-        # Final Report
-        st.markdown(f"""
-        **Live Physical Risk Report for: {location_name}**
-        
-        *   **Current Status:** :{risk_color}[**{risk_level} RISK**] detected.
-        *   **Precipitation (24h):** {rain} mm
-        *   **Wind Speed (Max):** {wind} km/h
-        
-        **AI Strategic Insight:**
-        Given the current weather data in **{country}**, {info.get('longName')} operations at the **{asset_label}** face **{risk_level.lower()}** disruption risk today. 
-        {"Heavy rainfall may impact local logistics and employee commute." if rain > 10 else "Weather conditions are optimal for operations."}
-        
-        *Data Source: OpenMeteo & OpenStreetMap live feed.*
-        """)
 
     except Exception as e:
         st.error(f"Error analyzing {ticker}: {e}")
