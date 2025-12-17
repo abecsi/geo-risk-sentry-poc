@@ -3,6 +3,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import requests
+import datetime
 from geopy.geocoders import Nominatim
 from duckduckgo_search import DDGS
 
@@ -18,7 +19,7 @@ ASSET_DB = {
         "Logistics": {"name": "Port of Zeebrugge (Major Import Hub)", "lat": 51.3328, "lon": 3.2064}
     },
     "NHY.OL": {
-        "Factory": {"name": "Sunndal Aluminum Smelter (Largest in Europe)", "lat": 62.6753, "lon": 8.5627},
+        "Factory": {"name": "Sunndal Aluminum Smelter", "lat": 62.6753, "lon": 8.5627},
         "Logistics": {"name": "Port of Sunndalsøra", "lat": 62.6790, "lon": 8.5400}
     },
     "ASML": {
@@ -26,7 +27,7 @@ ASSET_DB = {
         "Logistics": {"name": "Eindhoven Airport Cargo Hub", "lat": 51.4584, "lon": 5.3913}
     },
     "SHELL": {
-        "Factory": {"name": "Pernis Refinery (Largest in Europe)", "lat": 51.8833, "lon": 4.3833},
+        "Factory": {"name": "Pernis Refinery (Europe's Largest)", "lat": 51.8833, "lon": 4.3833},
         "Logistics": {"name": "Port of Rotterdam", "lat": 51.9500, "lon": 4.1333}
     },
     "EQNR": {
@@ -40,6 +41,10 @@ ASSET_DB = {
     "NESN.SW": { 
         "Factory": {"name": "Nespresso Production Centre (Orbe)", "lat": 46.7237, "lon": 6.5362},
         "Logistics": {"name": "Distribution Center Avenches", "lat": 46.8800, "lon": 7.0400}
+    },
+    "OCP": { # Added for your Morocco Trip
+        "Factory": {"name": "Jorf Lasfar Industrial Complex", "lat": 33.125, "lon": -8.636},
+        "Logistics": {"name": "Phosphate Port Terminal", "lat": 33.130, "lon": -8.640}
     }
 }
 
@@ -79,6 +84,11 @@ DEMO_DATA = {
         "longName": "Tesla Inc.", "sector": "Consumer Cyclical", "marketCap": 700000000000, "currency": "USD",
         "city": "Austin", "country": "United States", "totalRevenue": 96000000000, "beta": 2.0,
         "esgScores": {"totalEsg": 26.0}
+    },
+    "OCP": {
+        "longName": "OCP Group", "sector": "Basic Materials", "marketCap": 15000000000, "currency": "MAD",
+        "city": "Casablanca", "country": "Morocco", "totalRevenue": 9000000000, "beta": 0.8,
+        "esgScores": {"totalEsg": 32.0}
     }
 }
 
@@ -104,15 +114,19 @@ def get_coordinates(city, country):
 
 @st.cache_data(ttl=600)
 def get_live_weather_risk(lat, lon):
-    """Fetches real-time rain data from Open-Meteo API"""
+    """Fetches real-time Rain, Wind, AND Temperature data"""
     try:
-        url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=precipitation_sum,windspeed_10m_max&timezone=auto"
+        # Added 'temperature_2m_max' to the daily parameters
+        url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=precipitation_sum,windspeed_10m_max,temperature_2m_max&timezone=auto"
         response = requests.get(url).json()
+        
         rain_today = response['daily']['precipitation_sum'][0] 
-        wind_today = response['daily']['windspeed_10m_max'][0] 
-        return rain_today, wind_today
+        wind_today = response['daily']['windspeed_10m_max'][0]
+        temp_today = response['daily']['temperature_2m_max'][0] # New Heat Variable
+        
+        return rain_today, wind_today, temp_today
     except:
-        return 0, 0
+        return 0, 0, 0
 
 @st.cache_data(ttl=3600) 
 def fetch_live_data(ticker):
@@ -168,32 +182,54 @@ def get_real_esg_score(stock_object):
         pass
     return None, None
 
-def calculate_revenue_at_risk(info, rain_mm):
-    """Parametric Risk Model"""
+def calculate_revenue_at_risk(info, rain_mm, temp_c):
+    """Parametric Risk Model (Rain + Heat)"""
     revenue = info.get('totalRevenue')
-    if revenue is None: return None, None, None
+    if revenue is None: return None, None, None, "N/A"
     
     daily_revenue = revenue / 365
     sector = info.get('sector', 'Unknown')
     
-    # Vulnerability Logic
-    if any(x in sector for x in ['Energy', 'Basic Materials', 'Industrials', 'Utilities']):
+    # 1. Sector Vulnerability (Who hurts more?)
+    # Energy/Utilities = High (Solar derating, Grid sag)
+    # Tech = Medium (Cooling costs)
+    if any(x in sector for x in ['Energy', 'Utilities', 'Basic Materials']):
         vulnerability = 1.0 
     elif any(x in sector for x in ['Technology', 'Communication', 'Financial']):
-        vulnerability = 0.3 
+        vulnerability = 0.6 
     else:
-        vulnerability = 0.5 
+        vulnerability = 0.4 
 
-    # Weather Logic
-    if rain_mm >= 50: disruption_pct = 0.50 
-    elif rain_mm >= 20: disruption_pct = 0.15 
-    elif rain_mm >= 5: disruption_pct = 0.02 
-    else: disruption_pct = 0.0 
+    # 2. Rain Disruption Logic
+    if rain_mm >= 50: rain_drag = 0.50 
+    elif rain_mm >= 20: rain_drag = 0.15 
+    elif rain_mm >= 5: rain_drag = 0.02 
+    else: rain_drag = 0.0 
+
+    # 3. Heat Disruption Logic (New)
+    # Solar efficiency drops ~0.5% per degree > 25C. 
+    # Heavy industry slows down > 35C due to human safety limits.
+    if temp_c >= 40: heat_drag = 0.25 # Critical Heat
+    elif temp_c >= 35: heat_drag = 0.10 # Severe Heat
+    elif temp_c >= 30: heat_drag = 0.03 # Moderate Heat
+    else: heat_drag = 0.0
+
+    # 4. Determine Primary Driver
+    if heat_drag > rain_drag:
+        disruption_pct = heat_drag
+        driver = "Heat Stress"
+    else:
+        disruption_pct = rain_drag
+        driver = "Precipitation"
+        
+    # If no risk
+    if disruption_pct == 0:
+        driver = "None"
 
     estimated_loss = daily_revenue * vulnerability * disruption_pct
-    return daily_revenue, estimated_loss, disruption_pct
+    return daily_revenue, estimated_loss, disruption_pct, driver
 
-def get_climate_news(ticker, company_name):
+def get_climate_news(company_name):
     """Searches using DuckDuckGo News (Returns keys: date, source, url, title)"""
     results = []
     try:
@@ -201,13 +237,56 @@ def get_climate_news(ticker, company_name):
         search_query = f"{company_name} climate risk ESG supply chain"
         
         with DDGS() as ddgs:
-            # We use .news() to get the specific metadata keys you requested
+            # We use .news() to get the specific metadata keys
             for r in ddgs.news(search_query, max_results=3):
                 results.append(r)
     except Exception as e:
-        print(f"News Error: {e}")
         return []
     return results
+
+def generate_risk_memo(ticker, company_name, location_name, risk_level, rain, wind, temp, est_loss, currency, driver):
+    """Generates a text-based Audit Memo."""
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    report = f"""
+=============================================================
+GEO-RISK SENTRY | PHYSICAL CLIMATE RISK MEMO
+=============================================================
+CONFIDENTIAL - INTERNAL USE ONLY
+Date Generated: {timestamp}
+
+ASSET DETAILS
+-------------
+Target Entity:    {company_name} ({ticker})
+Asset Location:   {location_name}
+Data Source:      Open Source Intelligence (OSINT) & Live Satellites
+
+PHYSICAL RISK ASSESSMENT
+------------------------
+Risk Status:      {risk_level}
+Primary Driver:   {driver}
+Precipitation:    {rain} mm (24h forecast)
+Temperature:      {temp} °C (Daily Max)
+Wind Speed:       {wind} km/h (Max gust)
+
+FINANCIAL IMPACT ANALYSIS (PARAMETRIC)
+--------------------------------------
+Estimated Daily Revenue at Risk (VaR): {format_large_number(est_loss)} {currency}
+
+STRATEGIC INSIGHT
+-----------------
+Based on sector vulnerability and current weather patterns, this asset 
+is currently experiencing {risk_level} weather stress. 
+
+Operational drag is estimated based on the parametric trigger logic 
+v1.2 (Sector Vulnerability Factor).
+
+-------------------------------------------------------------
+Generated by Geo-Risk Sentry (PoC)
+Developed by Attila Bécsi
+=============================================================
+"""
+    return report
 
 # --- 4. MAIN APPLICATION ---
 
@@ -218,7 +297,7 @@ st.markdown("### Physical Risk & ESG Intelligence Dashboard")
 with st.sidebar:
     st.header("Asset Selection")
     ticker = st.text_input("Enter Stock Ticker:", "NHY.OL")
-    st.caption("✨ Best Data coverage: TSLA, NHY.OL, ASML, SHELL, EQNR, NOVN.SW, NESN.SW")
+    st.caption("✨ Best Data coverage: TSLA, NHY.OL, ASML, SHELL, EQNR, NOVN.SW, NESN.SW, OCP")
     
     st.divider()
     asset_type = st.selectbox(
@@ -263,9 +342,9 @@ if ticker:
 
     # C. REAL-TIME RISK DATA
     if lat:
-        rain, wind = get_live_weather_risk(lat, lon)
+        rain, wind, temp = get_live_weather_risk(lat, lon)
     else:
-        rain, wind = 0, 0
+        rain, wind, temp = 0, 0, 0
         lat, lon = 59.91, 10.75 # Default Fallback
 
     # --- DASHBOARD UI ---
@@ -306,13 +385,17 @@ if ticker:
     # 3. PARAMETRIC MODEL
     st.divider()
     st.subheader("💰 Parametric Revenue-at-Risk Model")
-    daily_rev, est_loss, disrupt_pct = calculate_revenue_at_risk(info, rain)
+    daily_rev, est_loss, disrupt_pct, driver = calculate_revenue_at_risk(info, rain, temp)
     
     if daily_rev:
         f1, f2, f3 = st.columns(3)
         with f1: st.metric("Daily Revenue (TTM)", f"{format_large_number(daily_rev)} {currency}")
-        with f2: st.metric("Operational Drag", f"{disrupt_pct*100:.1f}%", delta=f"{rain} mm Rain", delta_color="inverse" if disrupt_pct>0 else "off")
-        with f3: st.metric("Est. Daily Loss (VaR)", f"{format_large_number(est_loss)} {currency}", delta="Risk Exposure", delta_color="inverse" if est_loss>0 else "off")
+        
+        # Driver Logic
+        drag_label = f"{rain}mm Rain" if driver == "Precipitation" else f"{temp}°C Heat"
+        
+        with f2: st.metric("Operational Drag", f"{disrupt_pct*100:.1f}%", delta=drag_label, delta_color="inverse" if disrupt_pct>0 else "off")
+        with f3: st.metric("Est. Daily Loss (VaR)", f"{format_large_number(est_loss)} {currency}", delta=f"Driven by {driver}", delta_color="inverse" if est_loss>0 else "off")
 
     # 4. AI RISK REPORT
     st.divider()
@@ -320,9 +403,9 @@ if ticker:
     
     risk_level = "LOW"
     risk_color = "green"
-    if rain > 10: 
+    if rain > 10 or temp > 35: 
         risk_level = "MODERATE"; risk_color = "orange"
-    if rain > 30 or wind > 80: 
+    if rain > 30 or wind > 80 or temp > 40: 
         risk_level = "HIGH"; risk_color = "red"
 
     st.markdown(f"""
@@ -330,25 +413,50 @@ if ticker:
     
     *   **Current Status:** :{risk_color}[**{risk_level} RISK**] detected.
     *   **Precipitation (24h):** {rain} mm
+    *   **Temperature:** {temp} °C
     *   **Wind Speed (Max):** {wind} km/h
     
     **AI Strategic Insight:**
     Given the current weather data in **{country}**, {info.get('longName')} operations at the **{asset_label}** face **{risk_level.lower()}** disruption risk today. 
-    {"Heavy rainfall may impact local logistics and employee commute." if rain > 10 else "Weather conditions are optimal for operations."}
+    {"Heavy rainfall may impact local logistics and employee commute." if rain > 10 else ("Extreme heat may cause cooling efficiency loss." if temp > 30 else "Weather conditions are optimal for operations.")}
     
     *Data Source: OpenMeteo & OpenStreetMap live feed.*
     """)
 
-    # 5. NEWS (Restored to your specific request)
+    # 4b. DOWNLOAD REPORT
+    # Generate the text
+    memo_content = generate_risk_memo(
+        ticker=ticker,
+        company_name=info.get('longName'),
+        location_name=location_name,
+        risk_level=risk_level,
+        rain=rain,
+        wind=wind,
+        temp=temp,
+        est_loss=est_loss,
+        currency=currency,
+        driver=driver
+    )
+
+    d_col1, d_col2, d_col3 = st.columns([1, 2, 1])
+    with d_col2:
+        st.download_button(
+            label="📄 Download Risk Audit Memo",
+            data=memo_content,
+            file_name=f"Risk_Memo_{ticker}_{location_name}.txt",
+            mime="text/plain",
+            help="Export this analysis for Audit documentation."
+        )
+
+    # 5. NEWS
     st.divider()
     st.subheader("📰 OSINT: Live Climate News Scraper")
 
     long_name = info.get('longName', ticker)
-    news_items = get_climate_news(ticker, long_name)
+    news_items = get_climate_news(long_name)
 
     if news_items:
         for news in news_items:
-            # We use safe .get() to avoid errors if DDG changes keys
             title = news.get('title', 'No Title')
             body = news.get('body', news.get('title', ''))
             source = news.get('source', 'Unknown Source')
