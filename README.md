@@ -9,7 +9,7 @@ A small Streamlit prototype that looks at today's weather at a company's site an
 |---|---|
 | Company financials, ESG score (when returned) | Yahoo Finance (`yfinance`) |
 | Weather (daily rain, wind, max temperature) | Open-Meteo |
-| HQ geocoding | Nominatim (OpenStreetMap) |
+| HQ geocoding | Open-Meteo geocoding |
 | News headlines | DuckDuckGo search |
 
 A short hand-entered list of approximate site coordinates (e.g. Tesla Gigafactory Berlin, Norsk Hydro Sunndal) lets you switch between HQ, factory and logistics locations for a few example tickers.
@@ -42,7 +42,7 @@ If a tool like this were used for decisions, it would be an End User Computing (
 - **Change management and access control:** peer-reviewed changes, segregation of duties and controlled deployment.
 
 ## Tech stack
-Python 3.11 · Streamlit · Pandas · Geopy · yfinance · Open-Meteo · DuckDuckGo search
+Python 3.11 · Streamlit · Pandas · yfinance · Open-Meteo · DuckDuckGo search
 
 ---
 **Disclaimer:** Personal educational project built on public APIs. Not investment advice.

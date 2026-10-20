@@ -4,7 +4,6 @@ import pandas as pd
 import numpy as np
 import requests
 import time
-from geopy.geocoders import Nominatim
 from ddgs import DDGS
 
 # --- 1. CONFIGURATION ---
@@ -26,7 +25,7 @@ ASSET_DB = {
         "Factory": {"name": "Veldhoven Fabrication Plant", "lat": 51.4082, "lon": 5.4184, "avg_temp": 4.2, "avg_rain": 2.1},
         "Logistics": {"name": "Eindhoven Cargo Hub", "lat": 51.4584, "lon": 5.3913, "avg_temp": 4.0, "avg_rain": 2.1}
     },
-    "SHELL": {
+    "SHEL": {
         "Factory": {"name": "Pernis Refinery (Rotterdam)", "lat": 51.8833, "lon": 4.3833, "avg_temp": 5.5, "avg_rain": 2.2},
         "Logistics": {"name": "Port of Rotterdam", "lat": 51.9500, "lon": 4.1333, "avg_temp": 5.5, "avg_rain": 2.2}
     },
@@ -44,11 +43,17 @@ ASSET_DB = {
     }
 }
 
-# TIER 2: Static demo snapshots (approximate, not live), used only for the same ticker when Yahoo Finance is unavailable
-DEMO_DATA = {
-    "ASML": {"longName": "ASML Holding N.V.", "sector": "Technology", "marketCap": 380000000000, "currency": "EUR", "totalRevenue": 21000000000, "city": "Veldhoven", "country": "Netherlands"},
-    "NHY.OL": {"longName": "Norsk Hydro ASA", "sector": "Basic Materials", "marketCap": 130000000000, "currency": "NOK", "totalRevenue": 150000000000, "city": "Oslo", "country": "Norway"},
-    "NESN.SW": {"longName": "Nestlé S.A.", "sector": "Consumer Defensive", "marketCap": 260000000000, "currency": "CHF", "totalRevenue": 93000000000, "city": "Vevey", "country": "Switzerland"}
+# TIER 2: Static company profiles (hand-entered, approximate; revenue is FY2024 as reported).
+# Used when Yahoo's full profile endpoint is blocked (common on shared cloud IPs); market cap
+# still comes live from Yahoo's price endpoint where possible.
+STATIC_PROFILES = {
+    "TSLA": {"longName": "Tesla, Inc.", "sector": "Consumer Cyclical", "city": "Austin", "country": "United States", "hq": (30.2672, -97.7431), "totalRevenue": 97_700_000_000, "financialCurrency": "USD"},
+    "NHY.OL": {"longName": "Norsk Hydro ASA", "sector": "Basic Materials", "city": "Oslo", "country": "Norway", "hq": (59.9139, 10.7522), "totalRevenue": 203_600_000_000, "financialCurrency": "NOK"},
+    "ASML": {"longName": "ASML Holding N.V.", "sector": "Technology", "city": "Veldhoven", "country": "Netherlands", "hq": (51.4183, 5.4028), "totalRevenue": 28_300_000_000, "financialCurrency": "EUR"},
+    "SHEL": {"longName": "Shell plc", "sector": "Energy", "city": "London", "country": "United Kingdom", "hq": (51.5072, -0.1276), "totalRevenue": 289_000_000_000, "financialCurrency": "USD"},
+    "EQNR": {"longName": "Equinor ASA", "sector": "Energy", "city": "Stavanger", "country": "Norway", "hq": (58.9700, 5.7331), "totalRevenue": 103_800_000_000, "financialCurrency": "USD"},
+    "NOVN.SW": {"longName": "Novartis AG", "sector": "Healthcare", "city": "Basel", "country": "Switzerland", "hq": (47.5596, 7.5886), "totalRevenue": 50_300_000_000, "financialCurrency": "USD"},
+    "NESN.SW": {"longName": "Nestlé S.A.", "sector": "Consumer Defensive", "city": "Vevey", "country": "Switzerland", "hq": (46.4628, 6.8419), "totalRevenue": 91_400_000_000, "financialCurrency": "CHF"},
 }
 
 # --- 3. HELPER FUNCTIONS ---
@@ -60,13 +65,20 @@ def format_large_number(num):
     elif num >= 1_000_000: return f"{num / 1_000_000:.2f} M"
     else: return f"{num:,.0f}"
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def _geocode(city):
+    res = requests.get("https://geocoding-api.open-meteo.com/v1/search", params={"name": city, "count": 10}, timeout=10)
+    res.raise_for_status()
+    return res.json().get("results", [])
+
 def get_coordinates(city, country):
+    """Geocodes a city via Open-Meteo's geocoding API, preferring a match in the given country."""
     try:
-        geolocator = Nominatim(user_agent="geo_risk_app")
-        location = geolocator.geocode(f"{city}, {country}")
-        return (location.latitude, location.longitude) if location else (None, None)
+        results = _geocode(city)
     except Exception:
         return None, None
+    match = next((x for x in results if x.get("country") == country), results[0] if results else None)
+    return (match["latitude"], match["longitude"]) if match else (None, None)
 
 def _retry(fn, attempts=3, base_delay=1.5):
     """Retries transient failures (e.g. HTTP 429 rate limits on shared cloud IPs) with backoff."""
@@ -83,15 +95,31 @@ def _retry(fn, attempts=3, base_delay=1.5):
 def _fetch_company_info(ticker):
     return _retry(lambda: dict(yf.Ticker(ticker).info))
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_market_snapshot(ticker):
+    """Market cap and currency from Yahoo's price endpoint, which doesn't need the session crumb."""
+    fi = yf.Ticker(ticker).fast_info
+    return {"marketCap": fi["market_cap"], "currency": fi["currency"]}
+
 def get_company_info(ticker):
-    """Returns (info, error)."""
+    """Returns (info, source, error). source: 'live', 'partial' (static profile + live market cap), 'static' or None."""
+    error = None
     try:
         info = _fetch_company_info(ticker)
+        if info.get('longName'):
+            return info, "live", None
+        error = "no profile returned"
     except Exception as e:
-        return None, f"{type(e).__name__}: {e}"[:200]
-    if info.get('longName'):
-        return info, None
-    return None, "ticker not found"
+        error = f"{type(e).__name__}: {e}"[:200]
+
+    if ticker not in STATIC_PROFILES:
+        return None, None, error
+    info = dict(STATIC_PROFILES[ticker])
+    try:
+        info.update(_fetch_market_snapshot(ticker))
+        return info, "partial", error
+    except Exception:
+        return info, "static", error
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_esg(ticker):
@@ -169,31 +197,30 @@ st.markdown("### Educational proof of concept: physical weather risk at asset lo
 with st.sidebar:
     st.header("Asset Selection")
     ticker = st.text_input("Enter Stock Ticker:", "NHY.OL").upper()
-    st.caption("Site-level examples: TSLA, NHY.OL, ASML, SHELL, EQNR, NOVN.SW, NESN.SW")
+    st.caption("Site-level examples: TSLA, NHY.OL, ASML, SHEL, EQNR, NOVN.SW, NESN.SW")
     st.divider()
     asset_type = st.selectbox("Asset Layer:", ["Headquarters", "Primary Factory", "Logistics Hub"])
 
 if ticker:
     # --- A. DATA ACQUISITION ---
-    # Try Yahoo Finance first; fall back to a static snapshot only for the same ticker.
-    # Unknown tickers stop with an error instead of silently showing another company.
-    info, info_error = get_company_info(ticker)
-    is_demo_mode = False
+    # Try Yahoo Finance first; fall back to a static profile only for the same ticker.
+    # Other tickers stop with an error instead of silently showing another company.
+    info, source, info_error = get_company_info(ticker)
+    is_demo_mode = source != "live"
 
     if info is None:
-        if ticker in DEMO_DATA:
-            info = DEMO_DATA[ticker]
-            is_demo_mode = True
-            st.warning(f"⚠️ Live data unavailable for '{ticker}' ({info_error}). Showing a static demo snapshot (approximate, not live).")
-        else:
-            st.error(f"❌ No market data for '{ticker}' ({info_error}). No data shown.")
-            st.stop()
+        st.error(f"❌ No company data for '{ticker}' from Yahoo Finance ({info_error}). The ticker may not exist, or Yahoo may be blocking requests from this server.")
+        st.stop()
+    elif source == "partial":
+        st.info("ℹ️ Yahoo's company-profile endpoint is unavailable from this server. Market cap is live; sector, HQ and FY2024 revenue come from a static profile.")
+    elif source == "static":
+        st.warning(f"⚠️ Live market data unavailable for '{ticker}'. Showing a static profile (approximate, not live).")
 
     # --- B. GEOLOCATION LOGIC ---
     # 1. Default: Geocode the City/Country from the info dictionary
     city = info.get('city', 'Unknown')
     country = info.get('country', 'Unknown')
-    lat, lon = get_coordinates(city, country)
+    lat, lon = info['hq'] if 'hq' in info else get_coordinates(city, country)
 
     loc_name = f"{city} (HQ)"
     b_temp = None
@@ -233,6 +260,9 @@ if ticker:
     if not is_demo_mode:
         esg_score, esg_label = get_esg(ticker)
 
+    # Revenue is reported in the financial currency, which can differ from the trading currency
+    rev_ccy = info.get('financialCurrency') or info.get('currency', 'USD')
+
     # --- 5. DASHBOARD LAYOUT ---
 
     # ROW 1: METRICS
@@ -268,9 +298,9 @@ if ticker:
     st.caption("Not Value-at-Risk. Simple threshold rules and fixed sector weights; uncalibrated and unvalidated.")
     if weather_ok and daily_rev is not None:
         f1, f2, f3 = st.columns(3)
-        f1.metric("Est. Daily Revenue", f"{format_large_number(daily_rev)} {info.get('currency', 'USD')}")
+        f1.metric("Est. Daily Revenue", f"{format_large_number(daily_rev)} {rev_ccy}")
         f2.metric("Assumed Operational Drag", f"{drag_pct*100:.1f}%", delta=f"{temp}°C / {rain}mm", delta_color="inverse" if drag_pct > 0 else "off")
-        f3.metric("Illustrative Revenue at Risk", f"{format_large_number(est_loss)} {info.get('currency', 'USD')}", delta=f"Driver: {driver}", delta_color="inverse")
+        f3.metric("Illustrative Revenue at Risk", f"{format_large_number(est_loss)} {rev_ccy}", delta=f"Driver: {driver}", delta_color="inverse")
     else:
         st.info("Not available: requires both weather data and reported revenue.")
 
@@ -290,7 +320,7 @@ if ticker:
 
             memo = (f"GEO-RISK NOTE (educational PoC, heuristic only)\n"
                     f"Target: {info.get('longName')}\nLocation: {loc_name}\n"
-                    f"Data: {'static demo snapshot' if is_demo_mode else 'live Yahoo Finance'}\n"
+                    f"Data: {'live Yahoo Finance' if source == 'live' else 'static profile (partly live)' if source == 'partial' else 'static profile'}\n"
                     f"Heuristic level: {risk_lvl}\nIllustrative revenue at risk: {format_large_number(est_loss)}")
             st.download_button("📄 Download Summary Note", memo, f"Risk_Note_{ticker}.txt", "text/plain")
         else:
