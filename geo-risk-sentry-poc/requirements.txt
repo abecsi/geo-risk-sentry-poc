@@ -1,0 +1,8 @@
+streamlit
+yfinance>=0.2.50
+pandas
+numpy
+requests
+geopy
+watchdog
+duckduckgo_search
