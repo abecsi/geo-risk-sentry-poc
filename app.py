@@ -4,7 +4,11 @@ import pandas as pd
 import numpy as np
 import requests
 import time
+from datetime import datetime, timezone
 from ddgs import DDGS
+
+from risk_model import (MODEL_VERSION, RAIN_THRESHOLDS_MM, HEAT_THRESHOLDS_C, HIGH_VULNERABILITY_SECTORS,
+                        HIGH_VULNERABILITY_WEIGHT, DEFAULT_VULNERABILITY_WEIGHT, calculate_revenue_at_risk, risk_level)
 
 # --- 1. CONFIGURATION ---
 st.set_page_config(page_title="Geo-Risk Sentry", page_icon="🌍", layout="wide")
@@ -138,34 +142,24 @@ def _fetch_weather(lat, lon):
     return _retry(fetch)
 
 def get_live_weather(lat, lon):
-    """Returns ((rain_mm, wind_kmh, temp_max_c), error); values are None if unavailable."""
+    """Returns (forecast DataFrame indexed by date, error); the DataFrame is None if unavailable."""
     try:
         daily = _fetch_weather(lat, lon)
-        values = (daily['precipitation_sum'][0], daily['windspeed_10m_max'][0], daily['temperature_2m_max'][0])
-        if any(v is None for v in values):
+        df = pd.DataFrame({
+            "rain": daily['precipitation_sum'],
+            "wind": daily['windspeed_10m_max'],
+            "temp": daily['temperature_2m_max'],
+        }, index=pd.to_datetime(daily['time']))
+        # Data-quality check: today's values must be present and physically plausible
+        today = df.iloc[0]
+        if today.isna().any():
             return None, "incomplete response"
-        return values, None
+        if not (0 <= today.rain < 500 and -60 < today.temp < 60):
+            return None, f"implausible values (rain={today.rain}, temp={today.temp})"
+        return df.dropna(), None
     except Exception as e:
         # Signal "unavailable" explicitly rather than returning zeros that read as "no risk"
         return None, f"{type(e).__name__}: {e}"[:200]
-
-def calculate_revenue_at_risk(info, rain, temp):
-    """Illustrative heuristic only: step-function thresholds and fixed sector weights, not a calibrated or validated model."""
-    revenue = info.get('totalRevenue')
-    if not revenue:
-        return None, None, 0.0, "Revenue unavailable"
-    daily_rev = revenue / 365
-    sector = info.get('sector', 'Unknown')
-    vulnerability = 1.0 if any(x in sector for x in ['Energy', 'Materials', 'Utilities']) else 0.4
-
-    rain_drag = 0.5 if rain > 50 else (0.15 if rain > 20 else 0.0)
-    heat_drag = 0.25 if temp > 40 else (0.08 if temp > 32 else 0.0) # Assumed thermal stress on efficiency
-
-    disruption = max(rain_drag, heat_drag)
-    driver = "Heat Stress" if heat_drag > rain_drag else "Precipitation"
-    if disruption == 0: driver = "None"
-
-    return daily_rev, daily_rev * vulnerability * disruption, disruption, driver
 
 def get_real_esg(stock_obj):
     try:
@@ -196,10 +190,18 @@ st.markdown("### Educational proof of concept: physical weather risk at asset lo
 
 with st.sidebar:
     st.header("Asset Selection")
-    ticker = st.text_input("Enter Stock Ticker:", "NHY.OL").upper()
+    ticker = st.text_input("Enter Stock Ticker:", "ASML").strip().upper()
     st.caption("Site-level examples: TSLA, NHY.OL, ASML, SHEL, EQNR, NOVN.SW, NESN.SW")
     st.divider()
     asset_type = st.selectbox("Asset Layer:", ["Headquarters", "Primary Factory", "Logistics Hub"])
+    st.divider()
+    st.header("Stress Scenario")
+    st.caption("Add a hypothetical shock to today's forecast to see how the heuristic responds.")
+    rain_shock = st.slider("Extra rainfall (mm/day)", 0, 100, 0, step=5)
+    temp_shock = st.slider("Extra heat (°C)", 0, 20, 0)
+
+run_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+lineage = []  # (data element, source, status) for the data lineage panel
 
 if ticker:
     # --- A. DATA ACQUISITION ---
@@ -215,6 +217,13 @@ if ticker:
         st.info("ℹ️ Yahoo's company-profile endpoint is unavailable from this server. Market cap is live; sector, HQ and FY2024 revenue come from a static profile.")
     elif source == "static":
         st.warning(f"⚠️ Live market data unavailable for '{ticker}'. Showing a static profile (approximate, not live).")
+
+    profile_status = "🟢 Live" if source == "live" else "🟡 Static profile"
+    lineage += [
+        ("Company profile (name, sector, HQ)", "Yahoo Finance" if source == "live" else "Hand-entered profile", profile_status),
+        ("Market cap", "Yahoo Finance", "🟡 Static profile" if source == "static" else "🟢 Live"),
+        ("Revenue", "Yahoo Finance" if source == "live" else "Hand-entered (FY2024 annual report)", profile_status),
+    ]
 
     # --- B. GEOLOCATION LOGIC ---
     # 1. Default: Geocode the City/Country from the info dictionary
@@ -245,20 +254,29 @@ if ticker:
         st.error(f"❌ Could not locate '{city}, {country}'. Location-based risk cannot be assessed.")
         st.stop()
 
+    lineage.append(("Asset coordinates", "Hand-entered (public sources)" if exact or 'hq' in info else "Open-Meteo geocoding", "🟡 Approximate"))
+
     # --- C. WEATHER & HEURISTIC ---
-    weather, weather_error = get_live_weather(lat, lon)
-    weather_ok = weather is not None
+    forecast, weather_error = get_live_weather(lat, lon)
+    weather_ok = forecast is not None
     daily_rev = None
+    scenario_on = rain_shock > 0 or temp_shock > 0
     if weather_ok:
-        rain, wind, temp = weather
+        rain, wind, temp = forecast.iloc[0][["rain", "wind", "temp"]]
         daily_rev, est_loss, drag_pct, driver = calculate_revenue_at_risk(info, rain, temp)
+        if scenario_on:
+            s_rain, s_temp = rain + rain_shock, temp + temp_shock
+            _, s_loss, s_drag, s_driver = calculate_revenue_at_risk(info, s_rain, s_temp)
+        lineage.append(("Weather forecast (7 days)", "Open-Meteo", "🟢 Live, passed range checks"))
     else:
         st.warning(f"⚠️ Weather data unavailable (Open-Meteo: {weather_error}). Risk metrics are not shown.")
+        lineage.append(("Weather forecast (7 days)", "Open-Meteo", f"🔴 Unavailable ({weather_error})"))
 
     # --- ESG: shown only when the data source returns a value; never estimated ---
     esg_score, esg_label = None, None
     if not is_demo_mode:
         esg_score, esg_label = get_esg(ticker)
+    lineage.append(("ESG risk score", "Yahoo Finance", "🟢 Live" if esg_score is not None else "⚪ Not available (shown as N/A)"))
 
     # Revenue is reported in the financial currency, which can differ from the trading currency
     rev_ccy = info.get('financialCurrency') or info.get('currency', 'USD')
@@ -299,8 +317,29 @@ if ticker:
     if weather_ok and daily_rev is not None:
         f1, f2, f3 = st.columns(3)
         f1.metric("Est. Daily Revenue", f"{format_large_number(daily_rev)} {rev_ccy}")
-        f2.metric("Assumed Operational Drag", f"{drag_pct*100:.1f}%", delta=f"{temp}°C / {rain}mm", delta_color="inverse" if drag_pct > 0 else "off")
-        f3.metric("Illustrative Revenue at Risk", f"{format_large_number(est_loss)} {rev_ccy}", delta=f"Driver: {driver}", delta_color="inverse")
+        f2.metric("Assumed Operational Drag (today)", f"{drag_pct*100:.1f}%", delta=f"{temp:.1f}°C / {rain:.1f}mm", delta_color="inverse" if drag_pct > 0 else "off")
+        f3.metric("Illustrative Revenue at Risk (today)", f"{format_large_number(est_loss)} {rev_ccy}", delta=f"Driver: {driver}", delta_color="inverse")
+
+        # Stress scenario: same heuristic, shocked inputs
+        if scenario_on:
+            st.markdown(f"**Stress scenario:** +{rain_shock} mm rain, +{temp_shock} °C → {s_rain:.1f} mm / {s_temp:.1f} °C")
+            g1, g2, g3 = st.columns(3)
+            g1.metric("Scenario Risk Level", risk_level(s_drag), delta=f"Baseline: {risk_level(drag_pct)}", delta_color="off")
+            g2.metric("Scenario Operational Drag", f"{s_drag*100:.1f}%", delta=f"{(s_drag - drag_pct)*100:+.1f} pp vs. baseline", delta_color="inverse")
+            g3.metric("Scenario Revenue at Risk", f"{format_large_number(s_loss)} {rev_ccy}", delta=f"Driver: {s_driver}", delta_color="inverse")
+        else:
+            st.caption("Tip: use the Stress Scenario sliders in the sidebar to test the thresholds.")
+
+        # 7-day outlook from the same forecast
+        st.markdown("**7-day outlook** (illustrative revenue at risk per day)")
+        outlook = forecast.copy()
+        outlook[f"Revenue at risk ({rev_ccy})"] = [calculate_revenue_at_risk(info, r.rain, r.temp)[1] for r in outlook.itertuples()]
+        outlook.index = outlook.index.strftime("%a %d %b")
+        o1, o2 = st.columns([2, 1])
+        o1.bar_chart(outlook[f"Revenue at risk ({rev_ccy})"], height=220)
+        o2.dataframe(outlook[["rain", "temp", "wind"]].rename(columns={"rain": "Rain mm", "temp": "Max °C", "wind": "Wind km/h"}).round(1), height=220)
+        week_total = outlook[f"Revenue at risk ({rev_ccy})"].sum()
+        o2.caption(f"7-day total: **{format_large_number(week_total)} {rev_ccy}**")
     else:
         st.info("Not available: requires both weather data and reported revenue.")
 
@@ -310,7 +349,7 @@ if ticker:
     with col_l:
         st.subheader("📝 Rule-Based Summary")
         if weather_ok and daily_rev is not None:
-            risk_lvl = "HIGH" if drag_pct > 0.1 else ("MODERATE" if drag_pct > 0 else "LOW")
+            risk_lvl = risk_level(drag_pct)
             colour = {"HIGH": "red", "MODERATE": "orange", "LOW": "green"}[risk_lvl]
             st.markdown(f"**Status:** :{colour}[{risk_lvl}] (heuristic thresholds)")
             if drag_pct > 0:
@@ -318,10 +357,17 @@ if ticker:
             else:
                 st.write(f"Current conditions at {loc_name} are below all heuristic thresholds.")
 
+            data_source = 'live Yahoo Finance' if source == 'live' else 'static profile (partly live)' if source == 'partial' else 'static profile'
             memo = (f"GEO-RISK NOTE (educational PoC, heuristic only)\n"
-                    f"Target: {info.get('longName')}\nLocation: {loc_name}\n"
-                    f"Data: {'live Yahoo Finance' if source == 'live' else 'static profile (partly live)' if source == 'partial' else 'static profile'}\n"
-                    f"Heuristic level: {risk_lvl}\nIllustrative revenue at risk: {format_large_number(est_loss)}")
+                    f"Generated: {run_time} | Model version: {MODEL_VERSION}\n"
+                    f"Target: {info.get('longName')}\nLocation: {loc_name} ({lat:.4f}, {lon:.4f})\n"
+                    f"Data: {data_source}; weather from Open-Meteo\n"
+                    f"Today: {rain:.1f} mm, {temp:.1f} °C -> heuristic level {risk_lvl}\n"
+                    f"Illustrative revenue at risk (today): {format_large_number(est_loss)} {rev_ccy}\n"
+                    f"Illustrative revenue at risk (7 days): {format_large_number(week_total)} {rev_ccy}\n")
+            if scenario_on:
+                memo += f"Stress scenario (+{rain_shock} mm, +{temp_shock} °C): level {risk_level(s_drag)}, {format_large_number(s_loss)} {rev_ccy}\n"
+            memo += "Limitations: uncalibrated step-function heuristic; not Value-at-Risk; not validated.\n"
             st.download_button("📄 Download Summary Note", memo, f"Risk_Note_{ticker}.txt", "text/plain")
         else:
             st.markdown("**Status:** :gray[DATA UNAVAILABLE]")
@@ -337,6 +383,35 @@ if ticker:
             with st.expander(n.get('title', 'News')):
                 st.write(n.get('body', 'No snippet available.'))
                 st.markdown(f"[Read More]({n.get('url')})")
+    lineage.append(("News headlines", "DuckDuckGo search", "🔴 Unavailable" if news is None else "🟢 Live (unfiltered)"))
+
+    # ROW 6: GOVERNANCE
+    st.divider()
+    st.subheader("🛡️ Governance")
+    with st.expander("Data lineage & quality: where every number comes from", expanded=False):
+        st.caption(f"Retrieved: {run_time}. Failed sources are flagged, never replaced with zeros or estimates.")
+        st.dataframe(pd.DataFrame(lineage, columns=["Data element", "Source", "Status"]), hide_index=True, width="stretch")
+
+    with st.expander(f"Model card: revenue-at-risk heuristic v{MODEL_VERSION}"):
+        rain_rule = ", ".join(f"> {t} mm → {d:.0%}" for t, d in RAIN_THRESHOLDS_MM)
+        heat_rule = ", ".join(f"> {t} °C → {d:.0%}" for t, d in HEAT_THRESHOLDS_C)
+        st.markdown(f"""
+**Purpose:** illustrate how daily weather at a site could translate into lost revenue. Educational only, not for decisions.
+
+**Method:** daily revenue × sector weight × operational drag
+- Rain drag: {rain_rule}
+- Heat drag: {heat_rule}
+- Drag = the larger of the two (no compounding)
+- Sector weight: {HIGH_VULNERABILITY_WEIGHT} for {", ".join(HIGH_VULNERABILITY_SECTORS)}; {DEFAULT_VULNERABILITY_WEIGHT} otherwise
+
+**Key assumptions:** revenue is spread evenly over the year; one site stands for the whole company; impact lasts one day.
+
+**Limitations:** thresholds and weights are expert guesses with no calibration, backtesting or independent validation. Wind is shown but not modelled. No insurance or business-continuity offsets.
+
+**Controls in place:** unit tests on the calculation logic (run by GitHub Actions on every push); range checks on weather inputs; explicit "unavailable" states instead of silent defaults; versioned model logic.
+
+**What independent validation would need:** historical outage and loss data to calibrate thresholds, out-of-sample backtesting, sensitivity analysis, and ongoing monitoring.
+""")
 
 st.divider()
 st.warning("⚖️ **Educational PoC:** Built by Attila Bécsi. Open APIs only; heuristic, unvalidated outputs. Not financial advice. See README for limitations.")
