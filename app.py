@@ -3,8 +3,9 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import requests
+import time
 from geopy.geocoders import Nominatim
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 
 # --- 1. CONFIGURATION ---
 st.set_page_config(page_title="Geo-Risk Sentry", page_icon="🌍", layout="wide")
@@ -67,21 +68,58 @@ def get_coordinates(city, country):
     except Exception:
         return None, None
 
-@st.cache_data(ttl=600)
-def get_live_weather(lat, lon):
-    """Returns (rain_mm, wind_kmh, temp_max_c), or None if the data is unavailable."""
+def _retry(fn, attempts=3, base_delay=1.5):
+    """Retries transient failures (e.g. HTTP 429 rate limits on shared cloud IPs) with backoff."""
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception:
+            if i == attempts - 1:
+                raise
+            time.sleep(base_delay * (2 ** i))
+
+# Only successful responses are cached (exceptions are not), so a transient failure doesn't stick.
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_company_info(ticker):
+    return _retry(lambda: dict(yf.Ticker(ticker).info))
+
+def get_company_info(ticker):
+    """Returns (info, error)."""
     try:
-        url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=precipitation_sum,windspeed_10m_max,temperature_2m_max&timezone=auto"
-        res = requests.get(url, timeout=10)
+        info = _fetch_company_info(ticker)
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"[:200]
+    if info.get('longName'):
+        return info, None
+    return None, "ticker not found"
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_esg(ticker):
+    try:
+        return get_real_esg(yf.Ticker(ticker))
+    except Exception:
+        return None, None
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _fetch_weather(lat, lon):
+    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=precipitation_sum,windspeed_10m_max,temperature_2m_max&timezone=auto"
+    def fetch():
+        res = requests.get(url, timeout=10, headers={"User-Agent": "geo-risk-sentry-poc (educational)"})
         res.raise_for_status()
-        daily = res.json()['daily']
+        return res.json()['daily']
+    return _retry(fetch)
+
+def get_live_weather(lat, lon):
+    """Returns ((rain_mm, wind_kmh, temp_max_c), error); values are None if unavailable."""
+    try:
+        daily = _fetch_weather(lat, lon)
         values = (daily['precipitation_sum'][0], daily['windspeed_10m_max'][0], daily['temperature_2m_max'][0])
         if any(v is None for v in values):
-            return None
-        return values
-    except Exception:
+            return None, "incomplete response"
+        return values, None
+    except Exception as e:
         # Signal "unavailable" explicitly rather than returning zeros that read as "no risk"
-        return None
+        return None, f"{type(e).__name__}: {e}"[:200]
 
 def calculate_revenue_at_risk(info, rain, temp):
     """Illustrative heuristic only: step-function thresholds and fixed sector weights, not a calibrated or validated model."""
@@ -139,22 +177,16 @@ if ticker:
     # --- A. DATA ACQUISITION ---
     # Try Yahoo Finance first; fall back to a static snapshot only for the same ticker.
     # Unknown tickers stop with an error instead of silently showing another company.
-    info, stock, is_demo_mode = None, None, False
-    try:
-        stock = yf.Ticker(ticker)
-        if 'longName' in stock.info:
-            info = stock.info
-    except Exception:
-        stock = None
+    info, info_error = get_company_info(ticker)
+    is_demo_mode = False
 
     if info is None:
         if ticker in DEMO_DATA:
             info = DEMO_DATA[ticker]
-            stock = None
             is_demo_mode = True
-            st.warning(f"⚠️ Live data unavailable for '{ticker}'. Showing a static demo snapshot (approximate, not live).")
+            st.warning(f"⚠️ Live data unavailable for '{ticker}' ({info_error}). Showing a static demo snapshot (approximate, not live).")
         else:
-            st.error(f"❌ Ticker '{ticker}' not found or market data unavailable. No data shown.")
+            st.error(f"❌ No market data for '{ticker}' ({info_error}). No data shown.")
             st.stop()
 
     # --- B. GEOLOCATION LOGIC ---
@@ -187,19 +219,19 @@ if ticker:
         st.stop()
 
     # --- C. WEATHER & HEURISTIC ---
-    weather = get_live_weather(lat, lon)
+    weather, weather_error = get_live_weather(lat, lon)
     weather_ok = weather is not None
     daily_rev = None
     if weather_ok:
         rain, wind, temp = weather
         daily_rev, est_loss, drag_pct, driver = calculate_revenue_at_risk(info, rain, temp)
     else:
-        st.warning("⚠️ Weather data unavailable (Open-Meteo request failed). Risk metrics are not shown.")
+        st.warning(f"⚠️ Weather data unavailable (Open-Meteo: {weather_error}). Risk metrics are not shown.")
 
     # --- ESG: shown only when the data source returns a value; never estimated ---
     esg_score, esg_label = None, None
-    if not is_demo_mode and stock:
-        esg_score, esg_label = get_real_esg(stock)
+    if not is_demo_mode:
+        esg_score, esg_label = get_esg(ticker)
 
     # --- 5. DASHBOARD LAYOUT ---
 

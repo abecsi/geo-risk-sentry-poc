@@ -5,4 +5,4 @@ numpy
 requests
 geopy
 watchdog
-duckduckgo_search
+ddgs
