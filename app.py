@@ -3,16 +3,15 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import requests
-import datetime
 from geopy.geocoders import Nominatim
 from duckduckgo_search import DDGS
 
 # --- 1. CONFIGURATION ---
 st.set_page_config(page_title="Geo-Risk Sentry", page_icon="🌍", layout="wide")
 
-# --- 2. PROPRIETARY ASSET DATABASE (TIER 1) ---
-# Includes coordinates and "Climate Normals" for Context-Aware Anomaly Detection
-# Normals represent approximate historical averages for December
+# --- 2. ILLUSTRATIVE ASSET LIST (TIER 1) ---
+# Hand-entered, approximate coordinates from public sources (not independently verified).
+# Normals are rough December daily averages (avg_temp in °C, avg_rain in mm/day).
 ASSET_DB = {
     "TSLA": {
         "Factory": {"name": "Gigafactory Berlin", "lat": 52.3936, "lon": 13.7984, "avg_temp": 2.5, "avg_rain": 1.5},
@@ -34,26 +33,21 @@ ASSET_DB = {
         "Factory": {"name": "Mongstad Refinery", "lat": 60.8080, "lon": 5.0380, "avg_temp": 3.5, "avg_rain": 6.5},
         "Logistics": {"name": "Kollsnes Gas Hub", "lat": 60.5500, "lon": 4.8333, "avg_temp": 4.0, "avg_rain": 6.0}
     },
-    "NOVN.SW": { 
+    "NOVN.SW": {
         "Factory": {"name": "Stein Sterile Manufacturing Site", "lat": 47.5422, "lon": 7.9536, "avg_temp": 1.5, "avg_rain": 2.5},
         "Logistics": {"name": "Basel Supply Hub", "lat": 47.5623, "lon": 7.5756, "avg_temp": 2.0, "avg_rain": 2.3}
     },
-    "NESN.SW": { 
+    "NESN.SW": {
         "Factory": {"name": "Nespresso Production (Orbe)", "lat": 46.7237, "lon": 6.5362, "avg_temp": 0.8, "avg_rain": 2.8},
         "Logistics": {"name": "Distribution Center Avenches", "lat": 46.8800, "lon": 7.0400, "avg_temp": 1.0, "avg_rain": 2.5}
-    },
-    "OCP": { # For Morocco Field Research Content
-        "Factory": {"name": "Jorf Lasfar Complex", "lat": 33.125, "lon": -8.636, "avg_temp": 16.5, "avg_rain": 1.2},
-        "Logistics": {"name": "Phosphate Export Terminal", "lat": 33.130, "lon": -8.640, "avg_temp": 16.5, "avg_rain": 1.0}
     }
 }
 
-# TIER 2: Snapshot Fallbacks (If API is throttled)
+# TIER 2: Static demo snapshots (approximate, not live), used only for the same ticker when Yahoo Finance is unavailable
 DEMO_DATA = {
     "ASML": {"longName": "ASML Holding N.V.", "sector": "Technology", "marketCap": 380000000000, "currency": "EUR", "totalRevenue": 21000000000, "city": "Veldhoven", "country": "Netherlands"},
     "NHY.OL": {"longName": "Norsk Hydro ASA", "sector": "Basic Materials", "marketCap": 130000000000, "currency": "NOK", "totalRevenue": 150000000000, "city": "Oslo", "country": "Norway"},
-    "NESN.SW": {"longName": "Nestlé S.A.", "sector": "Consumer Defensive", "marketCap": 260000000000, "currency": "CHF", "totalRevenue": 93000000000, "city": "Vevey", "country": "Switzerland"},
-    "OCP": {"longName": "OCP Group", "sector": "Basic Materials", "marketCap": 15000000000, "currency": "MAD", "totalRevenue": 9000000000, "city": "Casablanca", "country": "Morocco"}
+    "NESN.SW": {"longName": "Nestlé S.A.", "sector": "Consumer Defensive", "marketCap": 260000000000, "currency": "CHF", "totalRevenue": 93000000000, "city": "Vevey", "country": "Switzerland"}
 }
 
 # --- 3. HELPER FUNCTIONS ---
@@ -70,29 +64,41 @@ def get_coordinates(city, country):
         geolocator = Nominatim(user_agent="geo_risk_app")
         location = geolocator.geocode(f"{city}, {country}")
         return (location.latitude, location.longitude) if location else (None, None)
-    except: return None, None
+    except Exception:
+        return None, None
 
 @st.cache_data(ttl=600)
 def get_live_weather(lat, lon):
+    """Returns (rain_mm, wind_kmh, temp_max_c), or None if the data is unavailable."""
     try:
         url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=precipitation_sum,windspeed_10m_max,temperature_2m_max&timezone=auto"
-        res = requests.get(url).json()
-        return res['daily']['precipitation_sum'][0], res['daily']['windspeed_10m_max'][0], res['daily']['temperature_2m_max'][0]
-    except: return 0, 0, 0
+        res = requests.get(url, timeout=10)
+        res.raise_for_status()
+        daily = res.json()['daily']
+        values = (daily['precipitation_sum'][0], daily['windspeed_10m_max'][0], daily['temperature_2m_max'][0])
+        if any(v is None for v in values):
+            return None
+        return values
+    except Exception:
+        # Signal "unavailable" explicitly rather than returning zeros that read as "no risk"
+        return None
 
-def calculate_va_r(info, rain, temp):
-    revenue = info.get('totalRevenue', 5_000_000_000)
+def calculate_revenue_at_risk(info, rain, temp):
+    """Illustrative heuristic only: step-function thresholds and fixed sector weights, not a calibrated or validated model."""
+    revenue = info.get('totalRevenue')
+    if not revenue:
+        return None, None, 0.0, "Revenue unavailable"
     daily_rev = revenue / 365
     sector = info.get('sector', 'Unknown')
     vulnerability = 1.0 if any(x in sector for x in ['Energy', 'Materials', 'Utilities']) else 0.4
-    
+
     rain_drag = 0.5 if rain > 50 else (0.15 if rain > 20 else 0.0)
-    heat_drag = 0.25 if temp > 40 else (0.08 if temp > 32 else 0.0) # Thermal stress on efficiency
-    
+    heat_drag = 0.25 if temp > 40 else (0.08 if temp > 32 else 0.0) # Assumed thermal stress on efficiency
+
     disruption = max(rain_drag, heat_drag)
     driver = "Heat Stress" if heat_drag > rain_drag else "Precipitation"
     if disruption == 0: driver = "None"
-    
+
     return daily_rev, daily_rev * vulnerability * disruption, disruption, driver
 
 def get_real_esg(stock_obj):
@@ -102,78 +108,72 @@ def get_real_esg(stock_obj):
             score = sus.loc['totalEsg', 'esgScores']
             label = "Low" if score < 20 else ("Medium" if score < 30 else "High")
             return score, label
-    except: pass
+    except Exception:
+        pass
     return None, None
 
 def get_news(company):
+    """Returns a list of articles, or None if the search failed."""
     results = []
     try:
         with DDGS() as ddgs:
             for r in ddgs.news(f"{company} climate risk supply chain", max_results=3):
                 results.append(r)
-    except: pass
+    except Exception:
+        return None
     return results
 
 # --- 4. UI COMPONENTS ---
 
-st.title("🌍 Geo-Risk Sentry: AI-Driven Asset Analysis")
-st.markdown("### Context-Aware Physical Risk & ESG Intelligence")
+st.title("🌍 Geo-Risk Sentry")
+st.markdown("### Educational proof of concept: physical weather risk at asset locations")
 
 with st.sidebar:
     st.header("Asset Selection")
     ticker = st.text_input("Enter Stock Ticker:", "NHY.OL").upper()
-    st.caption("✨ Deep Data: TSLA, NHY.OL, ASML, SHELL, EQNR, NESN.SW, OCP")
+    st.caption("Site-level examples: TSLA, NHY.OL, ASML, SHELL, EQNR, NOVN.SW, NESN.SW")
     st.divider()
     asset_type = st.selectbox("Asset Layer:", ["Headquarters", "Primary Factory", "Logistics Hub"])
 
 if ticker:
-    # --- A. DATA ACQUISITION (Robust Fallback Logic) ---
-    # 1. Check Internal Demo Data First (Fastest, supports OCP)
-    if ticker in DEMO_DATA:
-        info = DEMO_DATA[ticker]
+    # --- A. DATA ACQUISITION ---
+    # Try Yahoo Finance first; fall back to a static snapshot only for the same ticker.
+    # Unknown tickers stop with an error instead of silently showing another company.
+    info, stock, is_demo_mode = None, None, False
+    try:
+        stock = yf.Ticker(ticker)
+        if 'longName' in stock.info:
+            info = stock.info
+    except Exception:
         stock = None
-        is_demo_mode = True
-    else:
-        # 2. Try Yahoo Finance
-        try:
-            stock = yf.Ticker(ticker)
-            if 'longName' in stock.info:
-                info = stock.info
-                is_demo_mode = False
-            else:
-                # Yahoo failed to find ticker -> Fallback to ASML
-                info = DEMO_DATA["ASML"]
-                is_demo_mode = True
-        except:
-            # Internet/API Error -> Fallback to ASML
-            info = DEMO_DATA["ASML"]
+
+    if info is None:
+        if ticker in DEMO_DATA:
+            info = DEMO_DATA[ticker]
+            stock = None
             is_demo_mode = True
-    
-    if is_demo_mode and ticker not in DEMO_DATA:
-        st.warning(f"⚠️ Could not fetch live data for '{ticker}'. Showing demo data for ASML as placeholder.")
+            st.warning(f"⚠️ Live data unavailable for '{ticker}'. Showing a static demo snapshot (approximate, not live).")
+        else:
+            st.error(f"❌ Ticker '{ticker}' not found or market data unavailable. No data shown.")
+            st.stop()
 
     # --- B. GEOLOCATION LOGIC ---
     # 1. Default: Geocode the City/Country from the info dictionary
     city = info.get('city', 'Unknown')
     country = info.get('country', 'Unknown')
-    
-    # Try to find coordinates
     lat, lon = get_coordinates(city, country)
-    
-    # Initialize Context Variables (Default values to prevent NameError)
+
     loc_name = f"{city} (HQ)"
     b_temp = None
     b_rain = None
     exact = False
 
-    # 2. Tier 1 Override: Check if we have specific coordinates in ASSET_DB
+    # 2. Tier 1 Override: use site coordinates from ASSET_DB if available
     if ticker in ASSET_DB:
-        # Determine which asset type user selected
         db_key = "Factory" if "Factory" in asset_type else ("Logistics" if "Logistics" in asset_type else None)
-        
+
         if db_key:
             asset_data = ASSET_DB[ticker][db_key]
-            # OVERWRITE lat/lon with precise data
             lat = asset_data['lat']
             lon = asset_data['lon']
             loc_name = asset_data['name']
@@ -181,90 +181,100 @@ if ticker:
             b_rain = asset_data.get('avg_rain')
             exact = True
 
-    # 3. Final Safety Net: If lat is still None (Geocoding failed + No DB entry)
+    # 3. No location found: stop rather than assess risk at an arbitrary default location
     if lat is None:
-        lat, lon = 59.91, 10.75 # Default to Oslo
-        st.error(f"Could not locate '{city}, {country}'. Defaulting map to Oslo.")
+        st.error(f"❌ Could not locate '{city}, {country}'. Location-based risk cannot be assessed.")
+        st.stop()
 
-    # --- C. LIVE RISK ENGINE ---
-    # Now lat/lon are guaranteed to exist
-    rain, wind, temp = get_live_weather(lat, lon)
-    daily_rev, est_loss, drag_pct, driver = calculate_va_r(info, rain, temp)
-    
-    # --- FIXED ESG LOGIC ---
-    esg_score = None
-    esg_label = "N/A"
+    # --- C. WEATHER & HEURISTIC ---
+    weather = get_live_weather(lat, lon)
+    weather_ok = weather is not None
+    daily_rev = None
+    if weather_ok:
+        rain, wind, temp = weather
+        daily_rev, est_loss, drag_pct, driver = calculate_revenue_at_risk(info, rain, temp)
+    else:
+        st.warning("⚠️ Weather data unavailable (Open-Meteo request failed). Risk metrics are not shown.")
 
-    # 1. Try Real Data (If Yahoo is working)
+    # --- ESG: shown only when the data source returns a value; never estimated ---
+    esg_score, esg_label = None, None
     if not is_demo_mode and stock:
         esg_score, esg_label = get_real_esg(stock)
-    
-    # 2. If Real Data failed, check Dictionary Fallbacks
-    if esg_score is None:
-        # Check 'info' first (safely)
-        esg_score = info.get('esgScores', {}).get('totalEsg')
-        
-        # If still None, check DEMO_DATA explicitly
-        if esg_score is None and ticker in DEMO_DATA:
-             # USE .get() TO PREVENT KEYERROR CRASH
-             esg_score = DEMO_DATA[ticker].get('esgScores', {}).get('totalEsg')
-        
-        if esg_score:
-            esg_label = "Est. (Medium)"
 
     # --- 5. DASHBOARD LAYOUT ---
-    
+
     # ROW 1: METRICS
-    st.subheader(f"📊 Portfolio Insight: {info.get('longName')}")
+    st.subheader(f"📊 Company Overview: {info.get('longName')}")
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Sector", info.get('sector', 'Unknown'))
     m2.metric("Market Cap", f"{format_large_number(info.get('marketCap'))} {info.get('currency', 'USD')}")
     m3.metric("Asset Location", loc_name.split('(')[0])
-    m4.metric("Sustainalytics Risk", f"{esg_score:.1f}" if esg_score else "22.4", delta=esg_label if esg_label else "Medium", delta_color="inverse")
+    if esg_score is not None:
+        m4.metric("ESG Risk Score (Yahoo)", f"{esg_score:.1f}", delta=esg_label, delta_color="inverse")
+    else:
+        m4.metric("ESG Risk Score (Yahoo)", "N/A", help="No ESG score returned by the data source.")
 
-    # ROW 2: CONTEXT-AWARE SCAN (If in DB)
-    if b_temp is not None:
+    # ROW 2: ANOMALY VS. APPROXIMATE NORMS (if in DB)
+    if b_temp is not None and weather_ok:
         st.divider()
-        st.subheader("📉 Context-Aware Anomaly Scan")
+        st.subheader("📉 Weather vs. Approximate Norms")
         c1, c2, c3 = st.columns(3)
-        c1.metric("Temperature Anomaly", f"{temp - b_temp:+.1f} °C", help=f"Vs. Historical Norm ({b_temp}°C)", delta_color="inverse")
-        rain_diff = rain - (b_rain/30)
-        c2.metric("Precipitation Delta", "Drier" if rain_diff < 0 else "Wetter", f"{rain_diff:+.1f} mm", delta_color="off")
-        c3.info(f"**Baseline:** Benchmarking against historical {datetime.datetime.now().strftime('%B')} averages for these coordinates.")
+        c1.metric("Temperature Anomaly (approx.)", f"{temp - b_temp:+.1f} °C", help=f"Today's max vs. rough December daily norm ({b_temp}°C)", delta_color="inverse")
+        rain_diff = rain - b_rain  # both in mm/day
+        c2.metric("Precipitation vs. Norm (approx.)", "Drier" if rain_diff < 0 else "Wetter", f"{rain_diff:+.1f} mm/day", delta_color="off")
+        c3.info("**Baseline:** Hand-entered December daily averages. Indicative only, and not seasonally adjusted outside December.")
 
     # ROW 3: MAP
     st.divider()
     st.subheader(f"📍 Asset Monitor: {loc_name}")
-    if exact: st.success(f"✅ Verified Asset Coordinates: {loc_name}")
+    if exact: st.caption(f"Approximate site coordinates (public sources): {loc_name}")
     st.map(pd.DataFrame({'lat': [lat], 'lon': [lon], 'size': [150]}), zoom=11, size='size')
 
     # ROW 4: FINANCIALS
     st.divider()
-    st.subheader("💰 Parametric Revenue-at-Risk (VaR)")
-    f1, f2, f3 = st.columns(3)
-    f1.metric("Est. Daily Revenue", f"{format_large_number(daily_rev)} {info.get('currency', 'USD')}")
-    f2.metric("Operational Drag", f"{drag_pct*100:.1f}%", delta=f"{temp}°C / {rain}mm", delta_color="inverse" if drag_pct > 0 else "off")
-    f3.metric("Capital at Risk", f"{format_large_number(est_loss)} {info.get('currency', 'USD')}", delta=f"Driver: {driver}", delta_color="inverse")
+    st.subheader("💰 Illustrative Revenue-at-Risk Heuristic")
+    st.caption("Not Value-at-Risk. Simple threshold rules and fixed sector weights; uncalibrated and unvalidated.")
+    if weather_ok and daily_rev is not None:
+        f1, f2, f3 = st.columns(3)
+        f1.metric("Est. Daily Revenue", f"{format_large_number(daily_rev)} {info.get('currency', 'USD')}")
+        f2.metric("Assumed Operational Drag", f"{drag_pct*100:.1f}%", delta=f"{temp}°C / {rain}mm", delta_color="inverse" if drag_pct > 0 else "off")
+        f3.metric("Illustrative Revenue at Risk", f"{format_large_number(est_loss)} {info.get('currency', 'USD')}", delta=f"Driver: {driver}", delta_color="inverse")
+    else:
+        st.info("Not available: requires both weather data and reported revenue.")
 
-    # ROW 5: AI & NEWS
+    # ROW 5: SUMMARY & NEWS
     st.divider()
     col_l, col_r = st.columns([2,1])
     with col_l:
-        st.subheader("🤖 AI Strategic Insight")
-        risk_lvl = "HIGH" if drag_pct > 0.1 else ("MODERATE" if drag_pct > 0 else "LOW")
-        st.markdown(f"**Status:** :{ 'red' if risk_lvl=='HIGH' else 'orange'}[{risk_lvl} RISK] detected.")
-        st.write(f"Current conditions at {loc_name} reflect {driver.lower()} thresholds being exceeded. Financial impact is calculated based on {info.get('sector')} vulnerability curves.")
-        
-        # Download Button
-        memo = f"GEO-RISK MEMO\nTarget: {info.get('longName')}\nLocation: {loc_name}\nRisk: {risk_lvl}\nVaR: {format_large_number(est_loss)}"
-        st.download_button("📄 Download Audit Memo", memo, f"Risk_Memo_{ticker}.txt", "text/plain")
+        st.subheader("📝 Rule-Based Summary")
+        if weather_ok and daily_rev is not None:
+            risk_lvl = "HIGH" if drag_pct > 0.1 else ("MODERATE" if drag_pct > 0 else "LOW")
+            colour = {"HIGH": "red", "MODERATE": "orange", "LOW": "green"}[risk_lvl]
+            st.markdown(f"**Status:** :{colour}[{risk_lvl}] (heuristic thresholds)")
+            if drag_pct > 0:
+                st.write(f"Current conditions at {loc_name} exceed the {driver.lower()} threshold. Impact uses a fixed weight for the {info.get('sector')} sector.")
+            else:
+                st.write(f"Current conditions at {loc_name} are below all heuristic thresholds.")
+
+            memo = (f"GEO-RISK NOTE (educational PoC, heuristic only)\n"
+                    f"Target: {info.get('longName')}\nLocation: {loc_name}\n"
+                    f"Data: {'static demo snapshot' if is_demo_mode else 'live Yahoo Finance'}\n"
+                    f"Heuristic level: {risk_lvl}\nIllustrative revenue at risk: {format_large_number(est_loss)}")
+            st.download_button("📄 Download Summary Note", memo, f"Risk_Note_{ticker}.txt", "text/plain")
+        else:
+            st.markdown("**Status:** :gray[DATA UNAVAILABLE]")
 
     with col_r:
-        st.subheader("📰 Live OSINT News")
-        for n in get_news(info.get('longName')):
+        st.subheader("📰 Recent News (DuckDuckGo)")
+        news = get_news(info.get('longName'))
+        if news is None:
+            st.warning("News search unavailable.")
+        elif not news:
+            st.caption("No recent articles found.")
+        for n in news or []:
             with st.expander(n.get('title', 'News')):
                 st.write(n.get('body', 'No snippet available.'))
                 st.markdown(f"[Read More]({n.get('url')})")
 
 st.divider()
-st.warning("⚖️ **Educational PoC:** Built by Attila Bécsi. All data from open APIs. Not financial advice.")
+st.warning("⚖️ **Educational PoC:** Built by Attila Bécsi. Open APIs only; heuristic, unvalidated outputs. Not financial advice. See README for limitations.")

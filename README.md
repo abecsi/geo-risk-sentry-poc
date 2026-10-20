@@ -1,50 +1,50 @@
-# 🌍 Geo-Risk Sentry (Proof of Concept)
+# 🌍 Geo-Risk Sentry (Educational Proof of Concept)
 
-###  Overview
-**Geo-Risk Sentry** is a live physical climate risk dashboard designed for the next generation of Asset Management. 
+**Live demo:** https://geo-risk-sentry-attila-becsi.streamlit.app/
 
-Unlike static ESG reports that rely on backward-looking data, this tool uses **AI Agents** and **Real-Time OSINT (Open Source Intelligence)** to assess how live weather events impact specific corporate balance sheets.
+## What it is
+A small Streamlit prototype that looks at today's weather at a company's site and turns it into a simple, illustrative revenue-impact figure. It uses **open APIs only**:
 
-**Live Demo:** (https://geo-risk-sentry-attila-becsi.streamlit.app/)
+| Layer | Source |
+|---|---|
+| Company financials, ESG score (when returned) | Yahoo Finance (`yfinance`) |
+| Weather (daily rain, wind, max temperature) | Open-Meteo |
+| HQ geocoding | Nominatim (OpenStreetMap) |
+| News headlines | DuckDuckGo search |
 
-###  Core Capabilities
-The application integrates three distinct data layers to simulate a "Digital Twin" of physical risk:
+A short hand-entered list of approximate site coordinates (e.g. Tesla Gigafactory Berlin, Norsk Hydro Sunndal) lets you switch between HQ, factory and logistics locations for a few example tickers.
 
-1.  **Multi-Asset Resolution:**
-    *   Distinguishes between **Corporate HQs**, **Manufacturing Plants**, and **Logistics Hubs**.
-    *   Utilizes a **Tiered Data Architecture**:
-        *   *Tier 1:* Validated proprietary coordinates for major assets (e.g., Tesla Gigafactory Berlin, Norsk Hydro Sunndal).
-        *   *Tier 2:* Dynamic geocoding fallback for the "Long Tail" of global assets.
+## How it works
+1. Enter a ticker (e.g. `NHY.OL`, `EQNR`, `TSLA`).
+2. Financial data is fetched from Yahoo Finance. If that fails, a static snapshot is used for a few tickers and flagged as such. Unknown tickers show an error; no substitute company is shown.
+3. The site location comes from the example list or from geocoding the HQ city.
+4. Today's weather is fetched from Open-Meteo. If it is unavailable, the app says so and shows no risk figures.
+5. A **heuristic** applies step thresholds (rain > 20/50 mm, max temp > 32/40 °C) and a fixed sector weight to daily revenue, giving an *illustrative revenue-at-risk* figure and a rule-based LOW/MODERATE/HIGH label.
 
-2.  **Parametric Revenue-at-Risk (VaR) Model:**
-    *   Translates weather severity (mm of rain, wind speed) into **Financial Impact**.
-    *   Calculates `Daily Revenue-at-Risk` based on **Sector Vulnerability Factors** (e.g., Energy/Manufacturing assets are weighted higher for physical disruption than Tech/Services).
+## Known limitations
+- **Not Value-at-Risk.** The impact curve is a hand-set step function with no statistical basis, calibration or backtesting.
+- **No validation.** Thresholds and sector weights are assumptions and have not been tested against real outages.
+- **Demo fallback data.** Static snapshots are approximate and dated. Site coordinates and climate normals are hand-entered approximations of December daily averages.
+- **Single-day view.** It uses one daily forecast value and ignores duration, asset design, insurance and business continuity.
+- **No ESG estimation.** If no ESG score is returned, the app shows N/A.
+- **Limited testing.** There is no automated test suite, structured logging or input schema validation.
 
-3.  **AI-Driven OSINT (News Intelligence):**
-    *   Scrapes **Global News** (via DuckDuckGo API) to detect real-time sentiment regarding supply chain disruptions or climate events.
-    *   Includes **Entity Disambiguation** logic to filter out irrelevant noise (e.g., distinguishing "Alphabet Inc." from dictionary definitions, or "Tesla" the car company from "Tesla" the GPU architecture).
-    *   Enforces **Context-Aware Filtering** to prioritize business and risk-related headlines over general consumer news.
+## What a production version in a bank would need
+If a tool like this were used for decisions, it would be an End User Computing (EUC) tool, or possibly a model, and would need to be governed as one:
 
-###  Technical Logic
-1.  **Input:** User enters a financial ticker (e.g., `NHY.OL`, `NESN.SW`, `TSLA`).
-2.  **Data Ingestion:** Fetches live financial data (Market Cap, Revenue, Beta) via **Yahoo Finance**.
-3.  **Geospatial Processing:** Determines the precise coordinates of the asset using the proprietary Asset DB or **Nominatim** geocoding.
-4.  **Risk Trigger:** Queries **Open-Meteo API** for real-time precipitation and wind speed at those coordinates.
-5.  **Output:** Generates a live "Risk Scorecard" and an AI-generated strategic insight summary.
+- **Ownership and inventory:** a named owner, EUC/model inventory registration and a criticality rating.
+- **Testing:** unit tests for the calculation logic, regression tests and CI gating.
+- **Data quality controls:** source checks (completeness, staleness, range checks), reconciliation and documented lineage (BCBS 239 principles).
+- **Input validation and error handling:** explicit failure states and no silent defaults (partly done in this PoC).
+- **Logging and audit trail:** versioned inputs and outputs, so results can be reproduced.
+- **Model documentation:** purpose, methodology, assumptions, limitations and intended use.
+- **Independent review:** validation by a second line (model risk), with calibration and backtesting of the impact function, and ongoing performance monitoring.
+- **Change management and access control:** peer-reviewed changes, segregation of duties and controlled deployment.
 
-###  Tech Stack
-*   **Core:** Python 3.11
-*   **Frontend:** Streamlit
-*   **Data Engineering:** Pandas, NumPy
-*   **Geospatial:** Geopy, Nominatim API
-*   **Intelligence:** DuckDuckGo Search (OSINT), Open-Meteo (Weather), Yahoo Finance (Financials)
-
-###  Future Roadmap
-*   **Satellite Integration:** Direct ingestion of Sentinel-2 imagery to visualize flood water levels overlaying factory perimeters.
-*   **Supply Chain Graph:** Automatic mapping of Tier 1 and Tier 2 suppliers.
-*   **LLM Report Generation:** Automated PDF generation for Investment Committee memos using a new LLM.
+## Tech stack
+Python 3.11 · Streamlit · Pandas · Geopy · yfinance · Open-Meteo · DuckDuckGo search
 
 ---
-**Disclaimer:** This is a personal project demonstrating technical product management and quantitative risk capabilities. It uses public APIs and is not intended for commercial investment advice.
+**Disclaimer:** Personal educational project built on public APIs. Not investment advice.
 
-*Created by Attila Bécsi - (https://www.linkedin.com/in/attila-becsi/)*
+*Created by Attila Bécsi ([LinkedIn](https://www.linkedin.com/in/attila-becsi/))*
